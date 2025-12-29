@@ -1,6 +1,8 @@
 services:
   app:
     build: ./app
+    env_file:
+      - .env
     container_name: flask_app
     expose:
       - "5000"

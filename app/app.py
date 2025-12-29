@@ -1,40 +1,64 @@
+import os
+import sys
 import time
 import random
-import logging
 import hashlib
 import requests
+import pyotp
+import logging
+import uuid
+import smtplib
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
-ph = PasswordHasher() # По умолчанию использует Argon2id
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+# Загрузка конфигов
+app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'default-key-for-dev')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///users.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["200 per day"],
-    storage_uri="memory://",
-)
+# Инициализация расширений
+db = SQLAlchemy(app)
+ph = PasswordHasher()
 
-# Mock DB: admin@example.com / strongpass
-users = {
-    "admin@example.com": ph.hash("strongpass")
-}
+# Проверка ENCRYPTION_KEY
+enc_key = os.getenv('ENCRYPTION_KEY')
+if not enc_key:
+    print("Critical error: ENCRYPTION_KEY not found in environment!", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    cipher = Fernet(enc_key.encode())
+except Exception as e:
+    print(f"Critical error: key encryption: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# Модель БД
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    mfa_secret_encrypted = db.Column(db.String(255), nullable=True)
+    mfa_enabled = db.Column(db.Boolean, default=False)
+
+logging.basicConfig(level=logging.INFO)
+limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
 
 def is_password_pwned(password):
-    """HIBP API check с использованием k-anonymity"""
-    if not password:
-        return False
+    if not password: return False
     sha1_hash = hashlib.sha1(password.encode('utf-8')).hexdigest().upper()
     prefix, suffix = sha1_hash[:5], sha1_hash[5:]
     try:
-        # Критерий: Graceful fallback если API недоступно
         response = requests.get(f"https://api.pwnedpasswords.com/range/{prefix}", timeout=1.5)
         if response.status_code == 200:
             return suffix in response.text
@@ -42,57 +66,155 @@ def is_password_pwned(password):
         app.logger.error(f"HIBP API unreachable: {e}")
     return False
 
+# Добавляем в модель БД таблицу для токенов
+class ResetToken(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    token_hash = db.Column(db.String(128), index=True) # Хэшируем токен для защиты при утечке БД
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    expiry = db.Column(db.DateTime, nullable=False)
+    used = db.Column(db.Boolean, default=False)
+
+# Эндпоинт запроса сброса пароля
+@app.route('/password-reset', methods=['POST'])
+@limiter.limit("3 per hour") # Критерий: Ограничение попыток
+def request_reset():
+    data = request.json or {}
+    email = data.get('email')
+    user = User.query.filter_by(email=email).first()
+    
+    # Даже если пользователя нет, возвращаем успех (предотвращение перебора email)
+    if user:
+        token = str(uuid.uuid4())
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        
+        # Храним с TTL 10 минут
+        new_token = ResetToken(
+            token_hash=token_hash, 
+            user_id=user.id, 
+            expiry=datetime.utcnow() + timedelta(minutes=10)
+        )
+        db.session.add(new_token)
+        db.session.commit()
+        
+        # Демо-отправка email (SMTP настройки из .env)
+        send_reset_email(email, token)
+        app.logger.info(f"Password reset requested for: {email}")
+
+    return jsonify({"message": "If this email exists, a reset link has been sent."}), 200
+
+# Эндпоинт установки нового пароля
+@app.route('/password-confirm', methods=['POST'])
+def confirm_reset():
+    data = request.json or {}
+    token = data.get('token')
+    new_password = data.get('new_password')
+    mfa_code = data.get('mfa_code')
+    
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    reset_record = ResetToken.query.filter_by(token_hash=token_hash, used=False).first()
+    
+    # Проверка TTL и использования (Критерий: single-use, short TTL)
+    if not reset_record or reset_record.expiry < datetime.utcnow():
+        return jsonify({"error": "Invalid or expired token"}), 400
+    
+    user = User.query.get(reset_record.user_id)
+    
+    # Интеграция с MFA (Критерий: Require MFA if enabled)
+    if user.mfa_enabled:
+        if not mfa_code:
+            return jsonify({"status": "mfa_required", "message": "MFA code needed for reset"}), 202
+        secret = cipher.decrypt(user.mfa_secret_encrypted.encode()).decode()
+        if not pyotp.totp.TOTP(secret).verify(mfa_code):
+            return jsonify({"error": "Invalid MFA code"}), 401
+
+    # Проверка нового пароля на утечки (HIBP)
+    if is_password_pwned(new_password):
+        return jsonify({"error": "This password is compromised, choose another"}), 403
+
+    # Атомарное обновление (Критерий: Atomic transactions)
+    user.password_hash = ph.hash(new_password)
+    reset_record.used = True
+    db.session.commit()
+    
+    return jsonify({"status": "success", "message": "Password updated"}), 200
+
+def send_reset_email(email, token):
+    # Заглушка для демо. В реальности берем SMTP_HOST, SMTP_PORT из .env
+    print(f"DEBUG MAIL: Sending token {token} to {email}")
+
+@app.route('/mfa-setup', methods=['POST'])
+def mfa_setup():
+    data = request.json or {}
+    user = User.query.filter_by(email=data.get('email')).first()
+    if not user: return jsonify({"error": "User not found"}), 404
+    
+    secret = pyotp.random_base32()
+    user.mfa_secret_encrypted = cipher.encrypt(secret.encode()).decode()
+    db.session.commit()
+    
+    otp_uri = pyotp.totp.TOTP(secret).provisioning_uri(name=user.email, issuer_name="SecureAuthApp")
+    return jsonify({"secret": secret, "qr_uri": otp_uri}), 200
+
+@app.route('/mfa-verify', methods=['POST'])
+@limiter.limit("3 per minute")
+def mfa_verify():
+    data = request.json or {}
+    user = User.query.filter_by(email=data.get('email')).first()
+    if not user or not user.mfa_secret_encrypted:
+        return jsonify({"error": "MFA not set up"}), 400
+    
+    try:
+        secret = cipher.decrypt(user.mfa_secret_encrypted.encode()).decode()
+        totp = pyotp.totp.TOTP(secret)
+        if totp.verify(data.get('code')):
+            user.mfa_enabled = True
+            db.session.commit()
+            return jsonify({"status": "success", "message": "MFA enabled"}), 200
+    except Exception:
+        return jsonify({"error": "Decryption failed"}), 500
+        
+    return jsonify({"error": "Invalid code"}), 401
+
 @app.route('/login', methods=['POST'])
-@limiter.limit("5 per minute")
+@limiter.limit("10 per minute")
 def login():
     start_time = time.perf_counter()
-    # Увеличиваем до 1.2s, так как API HIBP + Argon2 требуют времени
-    target_duration = 1.2 
-    
-    data = request.get_json() or {}
+    data = request.json or {}
     email = data.get('email', '')
     password = data.get('password', '')
+    mfa_code = data.get('mfa_code')
 
-    # 1. HIBP Check (Критерий: No leaks, k-anonymity)
-    pwned = is_password_pwned(password)
-
-    # 2. Верификация (Критерий: Argon2id)
-    user_hash = users.get(email)
-    valid = False
+    user = User.query.filter_by(email=email).first()
+    valid_password = False
     
-    if user_hash:
+    if user:
         try:
-            # ph.verify защищен от тайминг-атак на уровне библиотеки
-            ph.verify(user_hash, password)
-            valid = True
-        except VerifyMismatchError:
-            pass
+            ph.verify(user.password_hash, password)
+            valid_password = True
+        except Exception: pass
     else:
-        # Критерий: Dummy hash для предотвращения перебора email по времени
-        ph.hash("dummy_password_for_timing_consistency")
+        ph.hash("dummy_password_for_timing")
 
-    # 3. Constant-time delay с Jitter (Критерий: 1.2s +/- 0.05s)
+    # Constant time delay (Stage 3)
     elapsed = time.perf_counter() - start_time
-    sleep_time = (target_duration + random.uniform(-0.05, 0.05)) - elapsed
-    if sleep_time > 0:
-        time.sleep(sleep_time)
+    time.sleep(max(0, 1.2 + random.uniform(-0.05, 0.05) - elapsed))
 
-    # 4. Логика ответов (Критерий: Generic messages)
-    if pwned:
-        app.logger.warning(f"Compromised password used: {email} | IP: {request.remote_addr}")
-        return jsonify({"status": "error", "message": "Password compromised! Change it immediately."}), 403
+    if not valid_password:
+        return jsonify({"error": "Invalid credentials"}), 401
 
-    if valid:
-        app.logger.info(f"Successful login: {email} | IP: {request.remote_addr}")
-        return jsonify({"status": "success", "message": "Welcome!"}), 200
-    
-    app.logger.warning(f"Failed login attempt: {email} | IP: {request.remote_addr}")
-    return jsonify({"status": "error", "message": "Invalid email or password"}), 401
+    if is_password_pwned(password):
+        return jsonify({"status": "error", "message": "Password compromised!"}), 403
 
-@app.errorhandler(429)
-def ratelimit_handler(e):
-    app.logger.warning(f"Rate limit hit | IP: {request.remote_addr}")
-    return jsonify({"error": "Too many requests. Please try again later."}), 429
+    # MFA Check
+    if user.mfa_enabled:
+        if not mfa_code:
+            return jsonify({"status": "mfa_required", "message": "Please provide MFA code"}), 202
+        
+        secret = cipher.decrypt(user.mfa_secret_encrypted.encode()).decode()
+        if not pyotp.totp.TOTP(secret).verify(mfa_code):
+            return jsonify({"error": "Invalid MFA code"}), 401
+
+    return jsonify({"status": "success", "message": "Logged in!"}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
