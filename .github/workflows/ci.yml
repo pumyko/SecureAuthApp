@@ -6,7 +6,8 @@ jobs:
   security-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -23,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r app/requirements.txt
-          pip install bandit
+          pip install bandit safety pytest-cov
 
       - name: Run Bandit (Static Analysis)
         run: bandit -r app/ -ll
@@ -32,6 +33,12 @@ jobs:
         run: safety check
 
       - name: Run Tests with Coverage
+        env:
+          DATABASE_URL: sqlite:///:memory:
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY || 'YTM0YjVjZTY3ZGUxMmFiY2RlZmdoabcdeffhijklmno=' }}
+          FLASK_SECRET_KEY: test-secret
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || 'test-id' }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET || 'test-secret' }}
         run: pytest --cov=app --cov-report=xml tests/
 
       - name: Upload Coverage report
@@ -39,11 +46,3 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
-        
-      - name: Run Tests with Coverage
-        env:
-          # Временные ключи для среды тестирования
-          DATABASE_URL: sqlite:///:memory:
-          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY || 'YTM0YjVjZTY3ZGUxMmFiY2RlZmdoabcdeffhijklmno=' }}
-          FLASK_SECRET_KEY: test-secret
-        run: pytest --cov=app --cov-report=xml tests/
