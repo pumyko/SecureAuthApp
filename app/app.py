@@ -17,6 +17,7 @@ from flask_limiter.util import get_remote_address
 from argon2 import PasswordHasher
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
+from authlib.integrations.flask_client import OAuth
 
 load_dotenv()
 
@@ -43,6 +44,16 @@ except Exception as e:
     print(f"Critical error: key encryption: {e}", file=sys.stderr)
     sys.exit(1)
 
+# Настройка OAuth
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=os.getenv('GOOGLE_CLIENT_ID'),
+    client_secret=os.getenv('GOOGLE_CLIENT_SECRET'),
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
+
 # Модель БД
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -50,6 +61,8 @@ class User(db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     mfa_secret_encrypted = db.Column(db.String(255), nullable=True)
     mfa_enabled = db.Column(db.Boolean, default=False)
+    oauth_provider = db.Column(db.String(50), nullable=True)
+    oauth_id = db.Column(db.String(100), unique=True, nullable=True)
 
 logging.basicConfig(level=logging.INFO)
 limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
@@ -65,6 +78,55 @@ def is_password_pwned(password):
     except Exception as e:
         app.logger.error(f"HIBP API unreachable: {e}")
     return False
+
+# Эндпоинт инициации входа
+@app.route('/oauth-login')
+@limiter.limit("5 per minute") # Критерий: Rate limit
+def oauth_login():
+    redirect_uri = "https://localhost/oauth-callback"
+    # Authlib автоматически генерирует и проверяет 'state' для защиты от CSRF
+    app.logger.info(f"OAuth login attempt from {request.user_agent}")
+    return google.authorize_redirect(redirect_uri)
+
+# Callback эндпоинт
+@app.route('/oauth-callback')
+def oauth_callback():
+    try:
+        token = google.authorize_access_token()
+        user_info = token.get('userinfo')
+    except Exception as e:
+        app.logger.error(f"OAuth error: {e}")
+        return jsonify({"error": "OAuth validation failed"}), 400
+
+    # Поиск или создание пользователя (интеграция с существующим flow)
+    user = User.query.filter_by(oauth_id=user_info['sub']).first()
+    
+    if not user:
+        # Если email уже есть в базе, привязываем OAuth к нему
+        user = User.query.filter_by(email=user_info['email']).first()
+        if user:
+            user.oauth_id = user_info['sub']
+            user.oauth_provider = 'google'
+        else:
+            # Создаем нового пользователя (без пароля, вход только через Google)
+            user = User(
+                email=user_info['email'],
+                oauth_id=user_info['sub'],
+                oauth_provider='google',
+                password_hash='OAUTH_USER' 
+            )
+            db.session.add(user)
+        db.session.commit()
+
+    # Критерий: MFA triggers post-OAuth if enabled
+    if user.mfa_enabled:
+        return jsonify({
+            "status": "mfa_required", 
+            "message": "OAuth success, please provide MFA code",
+            "email": user.email 
+        }), 202
+
+    return jsonify({"status": "success", "message": "Logged in via Google!"}), 200
 
 # Добавляем в модель БД таблицу для токенов
 class ResetToken(db.Model):
