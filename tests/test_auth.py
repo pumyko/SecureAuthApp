@@ -1,16 +1,19 @@
 import pytest
-from app.app import app
+from app import app, db, User
 
 @pytest.fixture
 def client():
-    with app.test_client() as client:
-        yield client
+    app.config['TESTING'] = True
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+    with app.app_context():
+        db.create_all()
+        yield app.test_client()
+        db.drop_all()
 
 def test_login_fail(client):
-    """Проверка, что неверный пароль возвращает 401"""
     response = client.post('/login', json={
         'email': 'admin@example.com',
         'password': 'wrongpassword'
     })
     assert response.status_code == 401
-    assert b"Invalid email or password" in response.data
+    assert response.json['error'] == "Invalid credentials"

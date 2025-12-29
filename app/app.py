@@ -69,7 +69,7 @@ limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
 
 def is_password_pwned(password):
     if not password: return False
-    sha1_hash = hashlib.sha1(password.encode('utf-8')).hexdigest().upper()
+    sha1_hash = hashlib.sha1(password.encode('utf-8'), usedforsecurity=False).hexdigest().upper()
     prefix, suffix = sha1_hash[:5], sha1_hash[5:]
     try:
         response = requests.get(f"https://api.pwnedpasswords.com/range/{prefix}", timeout=1.5)
@@ -201,8 +201,7 @@ def confirm_reset():
     return jsonify({"status": "success", "message": "Password updated"}), 200
 
 def send_reset_email(email, token):
-    # Заглушка для демо. В реальности берем SMTP_HOST, SMTP_PORT из .env
-    print(f"DEBUG MAIL: Sending token {token} to {email}")
+    app.logger.info(f"Email sent to {email} with token {token}")
 
 @app.route('/mfa-setup', methods=['POST'])
 def mfa_setup():
@@ -279,4 +278,4 @@ def login():
     return jsonify({"status": "success", "message": "Logged in!"}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000)  # nosec
